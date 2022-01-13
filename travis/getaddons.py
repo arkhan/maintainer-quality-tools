@@ -4,12 +4,15 @@ Usage: get-addons [-m] path1 [path2 ...]
 Given a list  of paths, finds and returns a list of valid addons paths.
 With -m flag, will return a list of modules names instead.
 """
-
+import logging
 import ast
 import os
 import sys
 
 from git_run import GitRun
+
+_logger = logging.getLogger(__name__)
+
 
 MANIFEST_FILES = [
     '__manifest__.py',
@@ -38,8 +41,8 @@ def is_installable_module(path):
     """return False if the path doesn't contain an installable odoo module,
     and the full path to the module manifest otherwise"""
     manifest_path = is_module(path)
+    _logger.info(manifest_path)
     if manifest_path:
-        print(manifest_path)
         manifest = ast.literal_eval(open(manifest_path).read())
         if manifest.get('installable', True):
             return manifest_path
