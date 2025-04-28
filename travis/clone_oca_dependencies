@@ -258,7 +258,7 @@ def install_requirements(reqfilename, use_uv=True):
     try:
         if use_uv:
             _logger.info(f"Installing requirements from {reqfilename} with uv")
-            command = ["uv", "pip", "install", "-r", reqfilename]
+            command = ["uv", "pip", "install", "--system", "-r", reqfilename]
             _logger.info("Calling %s", " ".join(command))
             subprocess.check_call(command)
         else:
