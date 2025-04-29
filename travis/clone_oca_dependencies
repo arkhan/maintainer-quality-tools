@@ -310,7 +310,13 @@ def run(deps_checkout_dir, build_dir):
     if osp.isdir(deps_checkout_dir):
         for repo in os.listdir(deps_checkout_dir):
             repo_path = osp.join(deps_checkout_dir, repo)
-            if osp.isdir(repo_path) and repo != ".git" and not repo.startswith("."):
+            # FIX: Añadido 'repo' antes de 'in processed'
+            if (
+                osp.isdir(repo_path)
+                and repo != ".git"
+                and not repo.startswith(".")
+                and repo not in processed
+            ):
                 _logger.info("Examining existing repo %s", repo)
                 processed.add(repo)
                 depfilename = osp.join(repo_path, "oca_dependencies.txt")
