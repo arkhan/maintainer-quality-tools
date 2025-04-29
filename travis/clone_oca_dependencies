@@ -25,14 +25,21 @@ The expected format for oca_dependencies.txt:
 """
 from __future__ import print_function
 
+import hashlib
+import json
 import logging
 import os
 import os.path as osp
+import shutil
 import subprocess
 import sys
+import time
 
 
 _logger = logging.getLogger()
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 
 
 def parse_depfile(depfile, owner="OCA"):
@@ -58,60 +65,305 @@ def parse_depfile(depfile, owner="OCA"):
 def git_checkout(deps_checkout_dir, reponame, url, branch):
     checkout_dir = osp.join(deps_checkout_dir, reponame)
     if not osp.isdir(checkout_dir):
+        _logger.info("Cloning %s from %s (branch %s)", reponame, url, branch)
         command = ["git", "clone", "-q", url, "-b", branch, checkout_dir]
+        subprocess.check_call(command)
+        return checkout_dir, True  # True indica que es un nuevo repositorio
     else:
-        command = [
+        # Verificar si hay cambios antes de hacer pull
+        git_dir = os.path.join(checkout_dir, ".git")
+        command_fetch = [
             "git",
-            "--git-dir=" + os.path.join(checkout_dir, ".git"),
+            "--git-dir=" + git_dir,
             "--work-tree=" + checkout_dir,
-            "pull",
-            "--ff-only",
-            url,
+            "fetch",
+            "origin",
             branch,
         ]
-    _logger.info("Calling %s", " ".join(command))
-    subprocess.check_call(command)
-    return checkout_dir
+        _logger.info("Fetching updates for %s", reponame)
+        subprocess.check_call(command_fetch)
+
+        # Verificar si hay diferencias
+        command_diff = [
+            "git",
+            "--git-dir=" + git_dir,
+            "--work-tree=" + checkout_dir,
+            "diff",
+            "--quiet",
+            "HEAD",
+            "origin/" + branch,
+        ]
+        try:
+            subprocess.check_call(command_diff)
+            _logger.info("No changes detected for %s", reponame)
+            return checkout_dir, False  # False indica que no hay cambios
+        except subprocess.CalledProcessError:
+            # Hay diferencias, hacer pull
+            _logger.info("Changes detected for %s, pulling updates", reponame)
+            command_pull = [
+                "git",
+                "--git-dir=" + git_dir,
+                "--work-tree=" + checkout_dir,
+                "pull",
+                "--ff-only",
+                url,
+                branch,
+            ]
+            subprocess.check_call(command_pull)
+            return checkout_dir, True  # True indica que hubo cambios
+
+
+def is_uv_installed():
+    """Verifica si uv está instalado en el sistema"""
+    try:
+        subprocess.check_output(["uv", "--version"], stderr=subprocess.STDOUT)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def install_uv():
+    """Instala uv si no está disponible"""
+    try:
+        _logger.info("Installing uv package manager...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "uv"])
+        _logger.info("UV installed successfully")
+        return True
+    except subprocess.CalledProcessError:
+        _logger.warning("Failed to install uv, falling back to pip")
+        return False
+
+
+def get_installed_packages():
+    """Obtiene un diccionario de paquetes instalados y sus versiones usando uv o pip"""
+    if is_uv_installed():
+        try:
+            output = subprocess.check_output(["uv", "pip", "freeze"]).decode("utf-8")
+            packages = {}
+            for line in output.splitlines():
+                if "==" in line:
+                    name, version = line.split("==", 1)
+                    packages[name.lower()] = version
+            return packages
+        except subprocess.CalledProcessError:
+            _logger.warning("Failed to get installed packages with uv, trying pip")
+
+    # Fallback to pip
+    try:
+        output = subprocess.check_output(
+            [sys.executable, "-m", "pip", "freeze"]
+        ).decode("utf-8")
+        packages = {}
+        for line in output.splitlines():
+            if "==" in line:
+                name, version = line.split("==", 1)
+                packages[name.lower()] = version
+        return packages
+    except subprocess.CalledProcessError:
+        _logger.warning("Failed to get installed packages")
+        return {}
+
+
+def get_required_packages(reqfilename):
+    """Parsea un archivo requirements.txt y devuelve un diccionario de paquetes"""
+    if not osp.isfile(reqfilename):
+        return {}
+
+    packages = {}
+    with open(reqfilename, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                # Manejo básico de requisitos
+                if "==" in line:
+                    name, version = line.split("==", 1)
+                    packages[name.lower()] = version
+                elif ">=" in line:
+                    name, version = line.split(">=", 1)
+                    packages[name.lower()] = "min:" + version
+                elif "<=" in line:
+                    name, version = line.split("<=", 1)
+                    packages[name.lower()] = "max:" + version
+                else:
+                    # Para requisitos sin versión específica o con sintaxis compleja
+                    if "[" in line:  # Manejar extras como package[extra]
+                        name = line.split("[")[0].lower()
+                    else:
+                        name = line.lower()
+                    packages[name] = "any"
+    return packages
+
+
+def should_install_requirements(reqfilename, installed_packages):
+    """Determina si un archivo requirements.txt necesita ser instalado"""
+    if not osp.isfile(reqfilename):
+        return False
+
+    required_packages = get_required_packages(reqfilename)
+
+    for pkg, version in required_packages.items():
+        if pkg not in installed_packages:
+            _logger.info(f"Package {pkg} not installed")
+            return True
+
+        # Si se especifica una versión exacta
+        if "==" in version or version.startswith("min:") or version.startswith("max:"):
+            # Simplificación: si hay cualquier especificación de versión,
+            # consideramos que puede ser necesario actualizar
+            _logger.info(f"Package {pkg} needs version check")
+            return True
+
+    return False
+
+
+def check_deps_cache_marker(deps_checkout_dir):
+    """
+    Verifica si hay un marcador de caché de dependencias
+    Si el marcador no existe o es muy antiguo, retornará True para indicar que se debe instalar
+    """
+    marker_file = osp.join(deps_checkout_dir, ".deps_cache_marker")
+    if not osp.isfile(marker_file):
+        # No hay marcador, crear uno y retornar True (instalar)
+        with open(marker_file, "w") as f:
+            f.write(str(int(time.time())))
+        return True
+
+    # Verificar la edad del marcador
+    try:
+        with open(marker_file, "r") as f:
+            timestamp = int(f.read().strip())
+
+        # Si el marcador tiene más de 24 horas (86400 segundos), actualizar
+        if (int(time.time()) - timestamp) > 86400:
+            _logger.info(
+                "Dependencies cache marker is older than 24 hours, updating dependencies"
+            )
+            with open(marker_file, "w") as f:
+                f.write(str(int(time.time())))
+            return True
+    except (IOError, ValueError):
+        # Si hay algún problema con el archivo, crear uno nuevo
+        with open(marker_file, "w") as f:
+            f.write(str(int(time.time())))
+        return True
+
+    return False
+
+
+def install_requirements(reqfilename, use_uv=True):
+    """Instala dependencias desde un archivo requirements.txt usando uv o pip"""
+    if not osp.isfile(reqfilename):
+        return False
+
+    try:
+        if use_uv:
+            _logger.info(f"Installing requirements from {reqfilename} with uv")
+            command = ["uv", "pip", "install", "--system", "-r", reqfilename]
+            _logger.info("Calling %s", " ".join(command))
+            subprocess.check_call(command)
+        else:
+            _logger.info(f"Installing requirements from {reqfilename} with pip")
+            command = [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--no-binary",
+                "pycparser",
+                "-r",
+                reqfilename,
+            ]
+            _logger.info("Calling %s", " ".join(command))
+            subprocess.check_call(command)
+        return True
+    except subprocess.CalledProcessError as e:
+        _logger.error(f"Error installing requirements: {e}")
+        if use_uv:
+            _logger.info("Falling back to pip")
+            return install_requirements(reqfilename, use_uv=False)
+        return False
 
 
 def run(deps_checkout_dir, build_dir):
     dependencies = []
     processed = set()
+    changes_detected = False
+    force_update = check_deps_cache_marker(deps_checkout_dir)
+
+    # Verificar si uv está instalado o intentar instalarlo
+    use_uv = is_uv_installed()
+    if not use_uv:
+        use_uv = install_uv()
+
+    # Obtener paquetes instalados actualmente
+    installed_packages = get_installed_packages()
+
+    # Procesar el repositorio principal
     depfilename = osp.join(build_dir, "oca_dependencies.txt")
     dependencies.append(depfilename)
     reqfilenames = []
+
     if osp.isfile(osp.join(build_dir, "requirements.txt")):
         reqfilenames.append(osp.join(build_dir, "requirements.txt"))
-    for repo in os.listdir(deps_checkout_dir):
-        _logger.info("examining %s", repo)
-        processed.add(repo)
-        depfilename = osp.join(deps_checkout_dir, repo, "oca_dependencies.txt")
-        dependencies.append(depfilename)
-        reqfilename = osp.join(deps_checkout_dir, repo, "requirements.txt")
-        if osp.isfile(reqfilename):
-            reqfilenames.append(reqfilename)
+
+    # Examinar repositorios ya clonados
+    if osp.isdir(deps_checkout_dir):
+        for repo in os.listdir(deps_checkout_dir):
+            repo_path = osp.join(deps_checkout_dir, repo)
+            # FIX: Añadido 'repo' antes de 'in processed'
+            if (
+                osp.isdir(repo_path)
+                and repo != ".git"
+                and not repo.startswith(".")
+                and repo not in processed
+            ):
+                _logger.info("Examining existing repo %s", repo)
+                processed.add(repo)
+                depfilename = osp.join(repo_path, "oca_dependencies.txt")
+                dependencies.append(depfilename)
+                reqfilename = osp.join(repo_path, "requirements.txt")
+                if osp.isfile(reqfilename):
+                    reqfilenames.append(reqfilename)
+
+    # Procesar dependencias en archivos OCA
     for depfilename in dependencies:
         try:
             with open(depfilename) as depfile:
                 deps = parse_depfile(depfile)
         except IOError:
             deps = []
+
         for depname, url, branch in deps:
-            _logger.info("* processing %s", depname)
+            _logger.info("Processing %s", depname)
             if depname in processed:
                 continue
+
             processed.add(depname)
-            checkout_dir = git_checkout(deps_checkout_dir, depname, url, branch)
+            checkout_dir, repo_changed = git_checkout(
+                deps_checkout_dir, depname, url, branch
+            )
+            changes_detected = changes_detected or repo_changed
+
             new_dep_filename = osp.join(checkout_dir, "oca_dependencies.txt")
             reqfilename = osp.join(checkout_dir, "requirements.txt")
+
             if osp.isfile(reqfilename):
                 reqfilenames.append(reqfilename)
+
             if new_dep_filename not in dependencies:
                 dependencies.append(new_dep_filename)
+
+    # Instalar requirements solo si es necesario
     for reqfilename in reqfilenames:
-        command = ["pip", "install", "--no-binary", "pycparser", "-Ur", reqfilename]
-        _logger.info("Calling %s", " ".join(command))
-        subprocess.check_call(command)
+        if force_update or should_install_requirements(reqfilename, installed_packages):
+            _logger.info("Installing requirements from %s", reqfilename)
+            install_result = install_requirements(reqfilename, use_uv=use_uv)
+            changes_detected = changes_detected or install_result
+        else:
+            _logger.info("Requirements from %s already satisfied", reqfilename)
+
+    if not changes_detected and not force_update:
+        _logger.info("No changes detected in repositories or requirements files")
 
 
 if __name__ == "__main__":
@@ -119,7 +371,7 @@ if __name__ == "__main__":
         deps_checkout_dir = osp.join(os.environ["HOME"], "dependencies")
         if not osp.exists(deps_checkout_dir):
             os.makedirs(deps_checkout_dir)
-        build_dir = os.environ["TRAVIS_BUILD_DIR"]
+        build_dir = os.environ.get("TRAVIS_BUILD_DIR", os.getcwd())
     elif len(sys.argv) == 2 or len(sys.argv) > 3:
         print(__doc__)
         sys.exit(1)
