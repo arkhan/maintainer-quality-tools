@@ -105,6 +105,20 @@ def get_addons(path):
 
     if is_addons(resolved_path):
         res = [resolved_path]
+        # Buscar addons válidos dentro de este addon también (búsqueda recursiva)
+        if os.path.isdir(resolved_path):
+            items = sorted(os.listdir(resolved_path))
+            for item in items:
+                # Saltar directorios ocultos
+                if item.startswith('.'):
+                    continue
+                    
+                item_path = os.path.join(resolved_path, item)
+                
+                # Buscar recursivamente addons dentro
+                if os.path.isdir(item_path):
+                    nested_addons = get_addons(item_path)
+                    res.extend(nested_addons)
     else:
         res = []
         if os.path.isdir(resolved_path):
@@ -123,6 +137,11 @@ def get_addons(path):
                         )
                     else:
                         res.append(item_path)
+                    # Búsqueda recursiva de addons anidados
+                    nested_addons = get_addons(item_path)
+                    # Remover el item_path mismo de los resultados anidados (ya fue agregado)
+                    nested_addons = [x for x in nested_addons if x != item_path]
+                    res.extend(nested_addons)
 
     # Remove duplicates while preserving order
     seen = set()
